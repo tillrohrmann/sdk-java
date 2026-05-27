@@ -481,17 +481,23 @@ class HandlerContextImpl implements HandlerContextInternal {
         Objects.requireNonNull(
             this.scheduledRuns.get(handle), "The given handle doesn't exist, this is an SDK bug");
     var startTime = Instant.now();
+    LOG.debug("Run with handle {} starting execution", handle);
     consumer.accept(
         new RunCompleter() {
           @Override
           public void proposeSuccess(Slice toWrite) {
+            LOG.debug(
+                "Run with handle {} completed successfully in {}",
+                handle,
+                Duration.between(startTime, Instant.now()));
             proposeRunSuccess(handle, toWrite);
           }
 
           @Override
           public void proposeFailure(Throwable toWrite, @Nullable RetryPolicy retryPolicy) {
-            proposeRunFailure(
-                handle, toWrite, Duration.between(startTime, Instant.now()), retryPolicy);
+            Duration attemptDuration = Duration.between(startTime, Instant.now());
+            LOG.debug("Run with handle {} completed with failure in {}", handle, attemptDuration);
+            proposeRunFailure(handle, toWrite, attemptDuration, retryPolicy);
           }
         });
   }

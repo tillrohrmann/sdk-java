@@ -11,6 +11,7 @@ package dev.restate.sdk.http.vertx;
 import dev.restate.sdk.endpoint.Endpoint;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
 import io.vertx.core.http.Http2Settings;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
@@ -115,6 +116,23 @@ public class RestateHttpServer {
   public static HttpServer fromEndpoint(
       Endpoint.Builder endpointBuilder, HttpServerOptions options) {
     return fromEndpoint(endpointBuilder.build(), options);
+  }
+
+  /**
+   * Create a Vert.x {@link HttpServer} from the provided endpoint, building the {@link Vertx}
+   * instance with the given {@link VertxOptions}.
+   */
+  public static HttpServer fromEndpoint(Endpoint endpoint, VertxOptions vertxOptions) {
+    return fromEndpoint(endpoint, DEFAULT_OPTIONS, vertxOptions);
+  }
+
+  /**
+   * Create a Vert.x {@link HttpServer} from the provided endpoint, with the given {@link
+   * HttpServerOptions}, building the {@link Vertx} instance with the given {@link VertxOptions}.
+   */
+  public static HttpServer fromEndpoint(
+      Endpoint endpoint, HttpServerOptions options, VertxOptions vertxOptions) {
+    return fromEndpoint(Vertx.vertx(vertxOptions), endpoint, options);
   }
 
   /** Create a Vert.x {@link HttpServer} from the provided endpoint. */

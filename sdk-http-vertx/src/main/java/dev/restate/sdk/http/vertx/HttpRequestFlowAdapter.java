@@ -22,11 +22,16 @@ class HttpRequestFlowAdapter implements Flow.Publisher<Slice> {
 
   private static final Logger LOG = LogManager.getLogger(HttpRequestFlowAdapter.class);
 
+  private static final long LOG_EVERY_N_BUFFERS = 64;
+
   private final HttpServerRequest httpServerRequest;
 
   private Flow.Subscriber<? super Slice> inputMessagesSubscriber;
   private long subscriberRequest = 0;
   private final Queue<ByteBuffer> buffers;
+
+  private long totalBytesReceived = 0;
+  private long receiveCount = 0;
 
   HttpRequestFlowAdapter(HttpServerRequest httpServerRequest) {
     this.httpServerRequest = httpServerRequest;
@@ -76,6 +81,19 @@ class HttpRequestFlowAdapter implements Flow.Publisher<Slice> {
   }
 
   private void handleIncomingBuffer(Buffer buffer) {
+    this.totalBytesReceived += buffer.length();
+    this.receiveCount++;
+    if (LOG.isDebugEnabled()
+        && (!this.buffers.isEmpty() || this.receiveCount % LOG_EVERY_N_BUFFERS == 0)) {
+      LOG.debug(
+          "Request buffer received: bytes={}, totalBytesReceived={}, receiveCount={}, queueDepth={}, subscriberRequest={}",
+          buffer.length(),
+          this.totalBytesReceived,
+          this.receiveCount,
+          this.buffers.size(),
+          this.subscriberRequest);
+    }
+
     // Fast path
     if (this.buffers.isEmpty() && this.subscriberRequest > 0) {
       this.inputMessagesSubscriber.onNext(Slice.wrap(buffer.getByteBuf().nioBuffer()));

@@ -21,9 +21,15 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
 
   private static final Logger LOG = LogManager.getLogger(HttpResponseFlowAdapter.class);
 
+  private static final long LOG_EVERY_N_WRITES = 64;
+
   private final HttpServerResponse httpServerResponse;
 
   private Flow.Subscription outputSubscription;
+
+  private long totalBytesProduced = 0;
+  private long writeCount = 0;
+  private boolean lastWriteQueueFull = false;
 
   HttpResponseFlowAdapter(HttpServerResponse httpServerResponse) {
     this.httpServerResponse = httpServerResponse;
@@ -43,6 +49,23 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
       cancelSubscription();
       return;
     }
+
+    this.totalBytesProduced += slice.readableBytes();
+    this.writeCount++;
+
+    boolean queueFull = this.httpServerResponse.writeQueueFull();
+    if (LOG.isDebugEnabled()
+        && (queueFull != this.lastWriteQueueFull || this.writeCount % LOG_EVERY_N_WRITES == 0)) {
+      long bytesWritten = this.httpServerResponse.bytesWritten();
+      LOG.debug(
+          "Response write: writeQueueFull={}, writeCount={}, totalBytesProduced={}, bytesWritten={}, estimatedPending={}",
+          queueFull,
+          this.writeCount,
+          this.totalBytesProduced,
+          bytesWritten,
+          this.totalBytesProduced - bytesWritten);
+    }
+    this.lastWriteQueueFull = queueFull;
 
     // If HTTP HEADERS frame have not been sent, Vert.x will send them
     this.httpServerResponse.write(
