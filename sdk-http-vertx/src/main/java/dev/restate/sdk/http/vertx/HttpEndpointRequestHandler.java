@@ -100,7 +100,26 @@ public class HttpEndpointRequestHandler implements Handler<HttpServerRequest> {
   }
 
   private Executor currentContextExecutor(Context currentContext) {
-    return runnable -> currentContext.runOnContext(v -> runnable.run());
+    return runnable -> {
+      if (!LOG.isDebugEnabled()) {
+        currentContext.runOnContext(v -> runnable.run());
+        return;
+      }
+      long enq = System.nanoTime();
+      currentContext.runOnContext(
+          v -> {
+            long start = System.nanoTime();
+            long qWaitMs = (start - enq) / 1_000_000L;
+            try {
+              runnable.run();
+            } finally {
+              long runMs = (System.nanoTime() - start) / 1_000_000L;
+              if (qWaitMs > 25 || runMs > 25) {
+                LOG.debug("ev-loop task: qWait={}ms run={}ms", qWaitMs, runMs);
+              }
+            }
+          });
+    };
   }
 
   /**
