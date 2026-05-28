@@ -64,7 +64,7 @@ class StateMachineImpl implements StateMachine {
   }
 
   private String invId() {
-    StartInfo si = this.stateContext.getStartInfo();
+    StartInfo si = this.stateContext.maybeGetStartInfo();
     return si == null ? "?" : si.debugId();
   }
 
