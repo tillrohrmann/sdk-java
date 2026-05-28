@@ -11,11 +11,13 @@ package dev.restate.sdk.http.vertx;
 import dev.restate.common.Slice;
 import dev.restate.sdk.core.ExceptionUtils;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServerResponse;
 import java.util.concurrent.Flow;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jspecify.annotations.Nullable;
 
 class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
 
@@ -30,6 +32,8 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
   private long totalBytesProduced = 0;
   private long writeCount = 0;
   private boolean lastWriteQueueFull = false;
+  private @Nullable Channel probeChannel;
+  private boolean probeAttachAttempted = false;
 
   HttpResponseFlowAdapter(HttpServerResponse httpServerResponse) {
     this.httpServerResponse = httpServerResponse;
@@ -53,17 +57,27 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
     this.totalBytesProduced += slice.readableBytes();
     this.writeCount++;
 
+    if (!this.probeAttachAttempted) {
+      this.probeAttachAttempted = true;
+      this.probeChannel = Http2DiagnosticProbes.attachToResponse(this.httpServerResponse);
+    }
+
     boolean queueFull = this.httpServerResponse.writeQueueFull();
     if (LOG.isDebugEnabled()
         && (queueFull != this.lastWriteQueueFull || this.writeCount % LOG_EVERY_N_WRITES == 0)) {
       long bytesWritten = this.httpServerResponse.bytesWritten();
+      String channelState =
+          this.probeChannel == null
+              ? ""
+              : ", " + Http2DiagnosticProbes.snapshotChannelState(this.probeChannel);
       LOG.debug(
-          "Response write: writeQueueFull={}, writeCount={}, totalBytesProduced={}, bytesWritten={}, estimatedPending={}",
+          "Response write: writeQueueFull={}, writeCount={}, totalBytesProduced={}, bytesWritten={}, estimatedPending={}{}",
           queueFull,
           this.writeCount,
           this.totalBytesProduced,
           bytesWritten,
-          this.totalBytesProduced - bytesWritten);
+          this.totalBytesProduced - bytesWritten,
+          channelState);
     }
     this.lastWriteQueueFull = queueFull;
 

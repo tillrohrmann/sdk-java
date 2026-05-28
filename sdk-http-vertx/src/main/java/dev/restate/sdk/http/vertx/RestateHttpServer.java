@@ -185,7 +185,8 @@ public class RestateHttpServer {
   public static HttpServer fromHandler(
       Vertx vertx, HttpEndpointRequestHandler handler, HttpServerOptions options) {
     EventLoopDiagnostics.attachIfEnabled(vertx);
-    HttpServer server = vertx.createHttpServer(options);
+    HttpServerOptions actualOptions = Http2DiagnosticProbes.configureOptions(options);
+    HttpServer server = vertx.createHttpServer(actualOptions);
     server.requestHandler(handler);
     return server;
   }
