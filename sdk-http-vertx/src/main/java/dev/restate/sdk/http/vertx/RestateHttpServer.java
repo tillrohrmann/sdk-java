@@ -187,6 +187,7 @@ public class RestateHttpServer {
     EventLoopDiagnostics.attachIfEnabled(vertx);
     HttpServerOptions actualOptions = Http2DiagnosticProbes.configureOptions(options);
     HttpServer server = vertx.createHttpServer(actualOptions);
+    Http2DiagnosticProbes.registerFlowControlSnapshotter(server);
     server.requestHandler(handler);
     return server;
   }
