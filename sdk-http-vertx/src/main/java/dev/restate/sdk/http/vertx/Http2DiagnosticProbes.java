@@ -11,8 +11,10 @@ package dev.restate.sdk.http.vertx;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
@@ -259,16 +261,35 @@ final class Http2DiagnosticProbes {
 
   private static void installOutboundFrameHandler(Channel channel) {
     try {
-      if (channel.pipeline().get(OUTBOUND_FRAME_HANDLER_NAME) != null) {
+      ChannelPipeline pipeline = channel.pipeline();
+      if (pipeline.get(OUTBOUND_FRAME_HANDLER_NAME) != null) {
         return;
       }
-      channel.pipeline().addLast(OUTBOUND_FRAME_HANDLER_NAME, new OutboundFrameProbe());
+      String http2HandlerName = null;
+      for (Map.Entry<String, ChannelHandler> e : pipeline.toMap().entrySet()) {
+        if (e.getValue() instanceof Http2ConnectionHandler) {
+          http2HandlerName = e.getKey();
+          break;
+        }
+      }
+      OutboundFrameProbe probe = new OutboundFrameProbe();
+      if (http2HandlerName != null) {
+        pipeline.addBefore(http2HandlerName, OUTBOUND_FRAME_HANDLER_NAME, probe);
+      } else {
+        pipeline.addFirst(OUTBOUND_FRAME_HANDLER_NAME, probe);
+      }
     } catch (Throwable t) {
       LOG.debug("Failed to install outbound frame probe", t);
     }
   }
 
   private static final class OutboundFrameProbe extends ChannelDuplexHandler {
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+      LOG.info("OutboundFrameProbe installed on conn={}", System.identityHashCode(ctx.channel()));
+      super.handlerAdded(ctx);
+    }
+
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
         throws Exception {
