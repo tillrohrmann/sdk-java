@@ -32,6 +32,8 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
   private long totalBytesProduced = 0;
   private long writeCount = 0;
   private boolean lastWriteQueueFull = false;
+  private long writesWhileQueueFull = 0;
+  private long queueFullStartNanos = 0;
   private @Nullable Channel probeChannel;
   private boolean probeAttachAttempted = false;
 
@@ -63,20 +65,34 @@ class HttpResponseFlowAdapter implements Flow.Subscriber<Slice> {
     }
 
     boolean queueFull = this.httpServerResponse.writeQueueFull();
+    if (queueFull) {
+      this.writesWhileQueueFull++;
+      if (!this.lastWriteQueueFull) {
+        this.queueFullStartNanos = System.nanoTime();
+      }
+    } else if (this.lastWriteQueueFull) {
+      this.queueFullStartNanos = 0;
+    }
     if (LOG.isDebugEnabled()
         && (queueFull != this.lastWriteQueueFull || this.writeCount % LOG_EVERY_N_WRITES == 0)) {
       long bytesWritten = this.httpServerResponse.bytesWritten();
+      long queueFullDurationMs =
+          this.queueFullStartNanos == 0
+              ? 0
+              : (System.nanoTime() - this.queueFullStartNanos) / 1_000_000L;
       String channelState =
           this.probeChannel == null
               ? ""
               : ", " + Http2DiagnosticProbes.snapshotChannelState(this.probeChannel);
       LOG.debug(
-          "Response write: writeQueueFull={}, writeCount={}, totalBytesProduced={}, bytesWritten={}, estimatedPending={}{}",
+          "Response write: writeQueueFull={}, writeCount={}, totalBytesProduced={}, bytesWritten={}, estimatedPending={}, writesWhileQueueFull={}, queueFullDurationMs={}{}",
           queueFull,
           this.writeCount,
           this.totalBytesProduced,
           bytesWritten,
           this.totalBytesProduced - bytesWritten,
+          this.writesWhileQueueFull,
+          queueFullDurationMs,
           channelState);
     }
     this.lastWriteQueueFull = queueFull;

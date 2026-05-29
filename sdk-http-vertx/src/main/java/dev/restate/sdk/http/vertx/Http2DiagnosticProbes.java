@@ -8,9 +8,12 @@
 // https://github.com/restatedev/sdk-java/blob/main/LICENSE
 package dev.restate.sdk.http.vertx;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
 import io.netty.handler.codec.http2.Http2Stream;
@@ -19,12 +22,14 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.http.impl.Http2ServerConnection;
 import java.lang.reflect.Field;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -37,11 +42,15 @@ final class Http2DiagnosticProbes {
       LogManager.getLogger("dev.restate.sdk.http.vertx.Http2DiagnosticProbes.writability");
   private static final Logger STREAM_WINDOWS_LOG =
       LogManager.getLogger("dev.restate.sdk.http.vertx.Http2DiagnosticProbes.streamWindows");
+  private static final Logger OUTBOUND_FRAMES_LOG =
+      LogManager.getLogger("dev.restate.sdk.http.vertx.Http2DiagnosticProbes.outboundFrames");
 
   private static final String HTTP2_SERVER_RESPONSE_CLASS =
       "io.vertx.core.http.impl.Http2ServerResponse";
   private static final String WRITABILITY_HANDLER_NAME = "restate-h2-writability-probe";
+  private static final String OUTBOUND_FRAME_HANDLER_NAME = "restate-h2-outbound-frame-probe";
   private static final long SNAPSHOT_INTERVAL_MS = 200;
+  private static final int FRAME_TYPE_SLOTS = 10;
 
   static final boolean ENABLED =
       isTruthy(System.getenv("RESTATE_DIAGNOSTICS_HTTP2"))
@@ -51,8 +60,16 @@ final class Http2DiagnosticProbes {
   private static volatile @Nullable Field ctxField;
   private static final Set<Channel> CHANNELS_WITH_HANDLER = ConcurrentHashMap.newKeySet();
   private static final Set<Http2Connection> H2_CONNECTIONS = ConcurrentHashMap.newKeySet();
+  private static final Map<Channel, OutboundFrameStats> FRAME_STATS = new ConcurrentHashMap<>();
   private static final AtomicReference<ScheduledExecutorService> SNAPSHOTTER =
       new AtomicReference<>();
+
+  private static final class OutboundFrameStats {
+    final AtomicLongArray writtenCount = new AtomicLongArray(FRAME_TYPE_SLOTS);
+    final AtomicLongArray inflightCount = new AtomicLongArray(FRAME_TYPE_SLOTS);
+    final AtomicLongArray bytesWritten = new AtomicLongArray(FRAME_TYPE_SLOTS);
+    final AtomicLongArray maxLatencyNs = new AtomicLongArray(FRAME_TYPE_SLOTS);
+  }
 
   private Http2DiagnosticProbes() {}
 
@@ -166,7 +183,13 @@ final class Http2DiagnosticProbes {
             }
             Http2Connection h2 = handler.connection();
             H2_CONNECTIONS.add(h2);
-            conn.closeHandler(v -> H2_CONNECTIONS.remove(h2));
+            FRAME_STATS.computeIfAbsent(channel, c -> new OutboundFrameStats());
+            installOutboundFrameHandler(channel);
+            conn.closeHandler(
+                v -> {
+                  H2_CONNECTIONS.remove(h2);
+                  FRAME_STATS.remove(channel);
+                });
             ensureSnapshotterStarted();
           } catch (Throwable t) {
             LOG.debug("Failed to register HTTP/2 connection for window snapshotter", t);
@@ -204,6 +227,129 @@ final class Http2DiagnosticProbes {
         LOG.debug("HTTP/2 window snapshot failed for one connection", t);
       }
     }
+    for (Map.Entry<Channel, OutboundFrameStats> e : FRAME_STATS.entrySet()) {
+      try {
+        snapshotFrameStats(e.getKey(), e.getValue());
+      } catch (Throwable t) {
+        LOG.debug("Outbound frame snapshot failed for one channel", t);
+      }
+    }
+  }
+
+  private static void snapshotFrameStats(Channel channel, OutboundFrameStats stats) {
+    int connHash = System.identityHashCode(channel);
+    for (int type = 0; type < FRAME_TYPE_SLOTS; type++) {
+      long written = stats.writtenCount.getAndSet(type, 0);
+      if (written == 0) {
+        continue;
+      }
+      long bytes = stats.bytesWritten.getAndSet(type, 0);
+      long maxLatNs = stats.maxLatencyNs.getAndSet(type, 0);
+      long inflight = stats.inflightCount.get(type);
+      OUTBOUND_FRAMES_LOG.warn(
+          "outbound-frame conn={} type={} writtenInTick={} inflight={} bytes={} maxLatencyMs={}",
+          connHash,
+          frameTypeName(type),
+          written,
+          inflight,
+          bytes,
+          maxLatNs / 1_000_000L);
+    }
+  }
+
+  private static void installOutboundFrameHandler(Channel channel) {
+    try {
+      if (channel.pipeline().get(OUTBOUND_FRAME_HANDLER_NAME) != null) {
+        return;
+      }
+      channel.pipeline().addLast(OUTBOUND_FRAME_HANDLER_NAME, new OutboundFrameProbe());
+    } catch (Throwable t) {
+      LOG.debug("Failed to install outbound frame probe", t);
+    }
+  }
+
+  private static final class OutboundFrameProbe extends ChannelDuplexHandler {
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
+        throws Exception {
+      if (msg instanceof ByteBuf buf) {
+        OutboundFrameStats stats = FRAME_STATS.get(ctx.channel());
+        if (stats != null) {
+          int[] types = walkFrameTypes(buf, stats);
+          if (types.length > 0) {
+            long t0 = System.nanoTime();
+            promise.addListener(
+                f -> {
+                  long dt = System.nanoTime() - t0;
+                  for (int type : types) {
+                    stats.inflightCount.decrementAndGet(type);
+                    long prev;
+                    do {
+                      prev = stats.maxLatencyNs.get(type);
+                      if (dt <= prev) break;
+                    } while (!stats.maxLatencyNs.compareAndSet(type, prev, dt));
+                  }
+                });
+          }
+        }
+      }
+      super.write(ctx, msg, promise);
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+      FRAME_STATS.remove(ctx.channel());
+      super.channelInactive(ctx);
+    }
+  }
+
+  private static int[] walkFrameTypes(ByteBuf buf, OutboundFrameStats stats) {
+    int idx = buf.readerIndex();
+    int end = buf.writerIndex();
+    int count = 0;
+    int[] tmp = new int[8];
+    while (idx + 9 <= end) {
+      int length = buf.getUnsignedMedium(idx);
+      int type = buf.getByte(idx + 3) & 0xff;
+      int frameEnd = idx + 9 + length;
+      if (frameEnd > end) {
+        break;
+      }
+      if (type < FRAME_TYPE_SLOTS) {
+        stats.writtenCount.incrementAndGet(type);
+        stats.inflightCount.incrementAndGet(type);
+        stats.bytesWritten.addAndGet(type, 9L + length);
+        if (count == tmp.length) {
+          int[] grown = new int[tmp.length * 2];
+          System.arraycopy(tmp, 0, grown, 0, count);
+          tmp = grown;
+        }
+        tmp[count++] = type;
+      }
+      idx = frameEnd;
+    }
+    if (count == tmp.length) {
+      return tmp;
+    }
+    int[] out = new int[count];
+    System.arraycopy(tmp, 0, out, 0, count);
+    return out;
+  }
+
+  private static String frameTypeName(int type) {
+    return switch (type) {
+      case 0 -> "DATA";
+      case 1 -> "HEADERS";
+      case 2 -> "PRIORITY";
+      case 3 -> "RST_STREAM";
+      case 4 -> "SETTINGS";
+      case 5 -> "PUSH_PROMISE";
+      case 6 -> "PING";
+      case 7 -> "GOAWAY";
+      case 8 -> "WINDOW_UPDATE";
+      case 9 -> "CONTINUATION";
+      default -> "TYPE_" + type;
+    };
   }
 
   private static void snapshotConnection(Http2Connection h2) throws Exception {
